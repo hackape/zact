@@ -12,7 +12,8 @@ export type ActorRef = {
 
 export type Receiver = {
   (msg: any): any
+  after?(timeout: number, fallback: () => any): Receiver
   canHandle?(msg: any): boolean
-  ttl?: number
+  timeout?: number
   fallback?(): any
 }

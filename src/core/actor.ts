@@ -218,9 +218,12 @@ export class Actor {
 
   private handleMessage(msg: any) {
     try {
+      this.status = ActorStatus.RUNNING
       return __internal__.provide(this, () => this.receiver!.call(this.module, msg))
     } catch (err) {
       return { type: EXIT, sender: this.pid, data: err } as ExitSignal
+    } finally {
+      this.status = ActorStatus.WAITING
     }
   }
 
@@ -237,9 +240,15 @@ export class Actor {
       if (!this.receiver || this.mailbox.length === 0) return
 
       if (isFunction(this.receiver.canHandle)) {
-        const msg = this.mailbox.pick(this.receiver.canHandle)
+        const [found, msg] = this.mailbox.find(this.receiver.canHandle)
         // cannot handle any msg, keep waiting
-        if (msg === undefined) return
+        if (!found) {
+          // TODO:
+          // when not found AND `msg !== undefined`
+          // it's an error in `canHandle()`
+          // should we raise it?
+          return
+        }
         ret = this.handleMessage(msg)
         this.cancelReceiverTakedown()
         this.receiver = undefined // automatically take down after use
@@ -265,15 +274,16 @@ export class Actor {
     if (isFunction(sig)) {
       this.status = ActorStatus.WAITING
       this.receiver = sig
-      const ttl = this.receiver!.ttl
-      if (typeof ttl === 'number' && ttl > 0) {
-        const afterFn = isFunction(this.receiver!.fallback) ? this.receiver!.fallback : noop
-        this.cancelReceiverTakedown = waitAfter(ttl, () => {
-          if (this.status === ActorStatus.DONE) return
+      const timeout = this.receiver!.timeout
+      if (typeof timeout === 'number' && timeout >= 0) {
+        const timeoutFallback = isFunction(this.receiver!.fallback) ? this.receiver!.fallback : noop
+        this.cancelReceiverTakedown = waitAfter(timeout, () => {
           // takedown receiver
           this.cancelReceiverTakedown = noop
+          if (this.status === ActorStatus.DONE) return
+
           this.receiver = undefined
-          const g = { next: () => ({ done: true, value: afterFn() }) }
+          const g = { next: () => ({ done: true, value: timeoutFallback() }) }
           this.stack.push(g)
           this.status = ActorStatus.CONTINUE
           this.feedback = undefined

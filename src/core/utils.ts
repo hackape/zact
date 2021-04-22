@@ -1,3 +1,6 @@
+import { Receiver } from './types'
+import { invariant, ErrorCode } from './invariant'
+
 export class Mailbox<M = any> {
   private _buffer: Array<M> = []
   private _queue: Array<M> = []
@@ -13,12 +16,16 @@ export class Mailbox<M = any> {
     this._queue = buffer.concat(this._queue)
   }
 
-  pick(predicate: (item: M) => boolean) {
-    const index = this._queue.findIndex(predicate)
-    if (index !== -1) {
-      return this._queue.splice(index, 1)[0]
-    } else {
-      return undefined
+  find(predicate: (item: M) => boolean): [boolean, any] {
+    try {
+      const index = this._queue.findIndex(predicate)
+      if (index !== -1) {
+        return [true, this._queue.splice(index, 1)[0]]
+      } else {
+        return [false, undefined]
+      }
+    } catch (err) {
+      return [false, err]
     }
   }
 
@@ -48,7 +55,7 @@ export function isAsyncIterator(t: any): t is AsyncIterableIterator<any> {
 }
 
 export function isIterResult(t: any): t is IteratorResult<any> {
-  return t && 'done' in t && 'value' in t
+  return typeof t === 'object' && t.hasOwnProperty('value') && t.hasOwnProperty('done')
 }
 
 export function isConstructor(t: any): t is new (...args: any[]) => any {
@@ -65,29 +72,52 @@ export function isFunction(t: any): t is (...args: any[]) => any {
   return typeof t === 'function'
 }
 
-export function receive(patterns) {
-  let msgTypes
-  let fallback
-  if (typeof patterns['_'] === 'function') {
-    msgTypes = Object.keys(patterns).filter(type => type !== '_')
-    fallback = patterns['_']
+type MessageHandler<M = any> = (msg: M) => any
+export function receive<M = any>(handler: MessageHandler<M>): Receiver
+export function receive<M>(patterns: { [messageType: string]: MessageHandler<M> }): Receiver
+export function receive(handler) {
+  let receiver: Receiver
+  if (isFunction(handler)) {
+    receiver = function receiver(msg) {
+      return handler(msg)
+    }
+
+    receiver.canHandle = () => true
+  } else if (typeof handler === 'object') {
+    const keys = Object.keys(handler).filter(x => x)
+
+    invariant(
+      keys.every(key => isFunction(handler[key])),
+      ErrorCode.ArgumentError,
+      `patterns must be an object of key-value pairs, where key is message type and value is a function`
+    )
+
+    const [canHandleAll, msgTypes] = isFunction(handler['_'])
+      ? [true, keys.filter(type => type !== '_')]
+      : [false, keys]
+
+    receiver = function receiver(msg) {
+      const msgHandler = handler[msg?.type] ?? handler['_']
+      return msgHandler?.(msg)
+    }
+
+    receiver.canHandle = msg => canHandleAll || msgTypes.includes(msg?.type)
   } else {
-    msgTypes = Object.keys(patterns)
+    const error = new Error(
+      'bad arguments: arg to `receive()` must be a function, or an object of key-value pairs, where key is message type and value is a function'
+    )
+    error.name = ErrorCode.ArgumentError
+    throw error
   }
 
-  function canHandle(msg) {
-    return fallback || msgTypes.includes(msg?.type)
+  function after(timeout: number, fallback: () => any) {
+    receiver.timeout = timeout
+    receiver.fallback = fallback
+    return receiver
   }
 
-  return {
-    canHandle,
-    next(msg) {
-      const handler = patterns[msg?.type] ?? patterns['_']
-      if (typeof handler === 'function') {
-        return { value: handler(msg), done: true }
-      }
-    },
-  }
+  receiver.after = after
+  return receiver
 }
 
 export function waitAfter(ms: number, next: () => void) {
