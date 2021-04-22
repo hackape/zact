@@ -1,4 +1,7 @@
-import type { ActorRef } from './actor'
+import type { ActorRef, Msg } from './types'
+
+// TODO: http://erlang.org/doc//man/sys.html
+// TODO: http://erlang.org/doc//man/sys.html#handle_system_msg-6
 
 const __SYS__ = Symbol('system')
 
@@ -9,8 +12,6 @@ export function isSystemMessage(msg: any) {
 export function toSystemMessage(sender: any, msg: Msg) {
   return [__SYS__, sender, msg]
 }
-
-type Msg = { type: string; sender?: ActorRef; data?: any }
 
 export const EXIT = ':EXIT' as const
 export const DOWN = ':DOWN' as const

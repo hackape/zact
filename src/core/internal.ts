@@ -1,4 +1,5 @@
-import type { Actor, ActorRef } from './actor'
+import type { ActorRef } from './types'
+import type { Actor } from './actor'
 
 // stack that tracks the current proc
 const procStack = [] as Actor[]

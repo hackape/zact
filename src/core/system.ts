@@ -1,5 +1,5 @@
+import type { ActorRef } from './types'
 import { toSystemMessage, EXIT } from './systemMessage'
-import type { ActorRef } from './actor'
 import * as __internal__ from './internal'
 import { invariant, ErrorCode, ErrorMessage } from './invariant'
 
@@ -14,11 +14,11 @@ export function self() {
 }
 
 export function stash(msg: any) {
-  __internal__.currentProc().stash(msg)
+  __internal__.currentProc().mailbox.stash(msg)
 }
 
 export function unstashAll(filter?: (msg: any) => boolean) {
-  __internal__.currentProc().unstashAll(filter)
+  __internal__.currentProc().mailbox.unstashAll(filter)
 }
 
 export function parent() {

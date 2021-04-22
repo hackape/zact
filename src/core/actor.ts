@@ -1,5 +1,6 @@
 import * as __internal__ from './internal'
 import { send, Process } from './system'
+import type { ActorRef, Receiver, SpawnOpts } from './types'
 import {
   EXIT,
   KILL,
@@ -11,36 +12,32 @@ import {
   isSystemMessage,
   toSystemMessage,
 } from './systemMessage'
-
-// TODO: http://erlang.org/doc//man/sys.html
-// TODO: http://erlang.org/doc//man/sys.html#handle_system_msg-6
+import {
+  isFunction,
+  isConstructor,
+  isIterator,
+  isAsyncIterator,
+  isIterResult,
+  isThenable,
+  Mailbox,
+  waitAfter,
+  noop,
+} from './utils'
 
 enum ActorStatus {
-  INIT = 0,
   WAITING = 1,
   RUNNING = 2,
-  DONE = 3,
+  CONTINUE = 3,
+  DONE = 4,
 }
 
-type SpawnOpts = {
-  link?: boolean
-  monitor?: boolean
-}
-
-export type ActorRef = {
-  send(msg: any): any
-  _pid: number
-}
-
-export class Actor<M = any> {
+export class Actor {
   pid: ActorRef
-  mailbox = new Mailbox<M>()
-  receive: (msg: any, meta: any) => any
+  mailbox = new Mailbox<any>()
   parent: Actor
   trapExit: boolean
 
-  private initializer: () => any
-  private status = ActorStatus.INIT
+  private status = ActorStatus.CONTINUE
 
   _links = new Set<ActorRef>()
   // propagate exit signal to linked procs
@@ -79,75 +76,29 @@ export class Actor<M = any> {
     return true
   }
 
-  constructor(module: any, func: string, args: any[], options: SpawnOpts) {
-    this.parent = __internal__.currentProc()
-
-    const [actorRef, invalidateActorRef] = __internal__.createActorRef(this)
-    this.onTerminate(invalidateActorRef)
-    this.pid = actorRef
-
-    if (options.link) {
-      Process.link(this.pid)
+  private terminate(_sig: ExitSignal) {
+    if (this.status === ActorStatus.DONE) {
+      console.warn('Weird! Terminate twice!')
+      return
     }
 
-    if (options.monitor) {
-      Process.monitor(this.pid)
+    this.status = ActorStatus.DONE
+    // aftermath
+    this.dispose()
+    // ensure exitSig originates from self
+    // convert reason :kill to :killed
+    const sig: ExitSignal = { type: EXIT, sender: this.pid, data: _sig.data === KILL ? ':killed' : _sig.data }
+    this.propagateToLink(sig)
+    this.notifyMonitor(sig)
+
+    // cleanup internal states
+    if (this._monitors.size) {
+      this._monitors.forEach(childRef => {
+        const child = __internal__.getProcByActorRef(childRef)
+        child?._monitoredBy.delete(this.pid)
+      })
     }
-
-    const newable = Boolean(module && module?.prototype?.constructor === module)
-    const callable = typeof module === 'function'
-    this.initializer = () => {
-      // upon entering, unset `this.receive, this.initializer`
-      // @ts-ignore
-      this.receive = this.initializer = null
-      // module is function
-      if (callable) {
-        const receiver = newable ? new module(...args) : module(...args)
-        if (!receiver) return
-        if (typeof receiver === 'function') return receiver
-        if (typeof receiver[func] === 'function') {
-          // TODO: think about the API for class base module
-          return receiver[func].bind(receiver)
-        }
-        throw Error(`Cannot find function \`${func}\` in module`)
-      }
-    }
-  }
-
-  start() {
-    // start by setting initializer as the first receiver
-    // and send a `null` message to trigger coroutine
-    this.status = ActorStatus.WAITING
-    this.receive = this.initializer
-    this.send(null)
-  }
-
-  send(msg: any) {
-    if (isSystemMessage(msg)) {
-      // currently support only ExitSignal
-      // if `trapExit`, ExitSignal MAY be unpack and re-route to mailbox
-      this.onReceiveExitSignal(msg[2])
-      return msg
-    } else {
-      this.mailbox.enqueue(msg)
-      if (this._monitors.size && msg?.[0] === DOWN) {
-        // once DOWN message is delivered
-        // should remove record from `_monitors`
-        const downSignal = msg as DownSignal
-        const monRefId = downSignal[1]
-        this._monitors.delete(monRefId)
-      }
-      this.next()
-      return msg
-    }
-  }
-
-  stash(msg: any) {
-    this.mailbox.stash(msg)
-  }
-
-  unstashAll(filter?: (item: M) => boolean) {
-    this.mailbox.unstashAll(filter)
+    // expect internal states to be empty by now
   }
 
   private onReceiveExitSignal(sig: ExitSignal) {
@@ -180,132 +131,196 @@ export class Actor<M = any> {
     }
   }
 
-  private terminate(_sig: ExitSignal) {
-    if (this.status === ActorStatus.DONE) {
-      console.warn('Weird! Terminate twice!')
-      return
+  private module: any = null
+  constructor(m: any, func: string, args: any[], options: SpawnOpts) {
+    this.parent = __internal__.currentProc()
+
+    const [actorRef, invalidateActorRef] = __internal__.createActorRef(this)
+    this.onTerminate(invalidateActorRef)
+    this.pid = actorRef
+
+    if (options.link) {
+      Process.link(this.pid)
     }
 
-    this.status = ActorStatus.DONE
-    // aftermath
-    this.dispose()
-    // ensure exitSig originates from self
-    // convert reason :kill to :killed
-    const sig: ExitSignal = { type: EXIT, sender: this.pid, data: _sig.data === KILL ? ':killed' : _sig.data }
-    this.propagateToLink(sig)
-    this.notifyMonitor(sig)
-
-    // cleanup internal states
-    if (this._monitors.size) {
-      this._monitors.forEach(childRef => {
-        const child = __internal__.getProcByActorRef(childRef)
-        child?._monitoredBy.delete(this.pid)
-      })
+    if (options.monitor) {
+      Process.monitor(this.pid)
     }
-    // expect internal states to be empty by now
+
+    const newable = isConstructor(m)
+    const callable = isFunction(m)
+    const initializer = () => {
+      if (func) {
+        if (newable) {
+          const instance = new m(...args)
+          if (!isFunction(instance[func])) throw Error(`Cannot find function \`${func}\` in module`)
+          this.module = instance
+          return { done: true, value: instance[func] }
+        } else {
+          if (!isFunction(m[func])) throw Error(`Cannot find function \`${func}\` in module`)
+          return { done: true, value: m[func] }
+        }
+      } else {
+        if (!callable) throw Error('Invalid argument')
+        return { done: true, value: m(...args) }
+      }
+    }
+
+    this.stack.push({ next: initializer })
   }
 
-  _args = new Array(1)
-  private getCoroutineArgs() {
-    this._args[0] = this.mailbox.dequeue()
-    return this._args
+  start() {
+    // start by setting initializer as the first receiver
+    // and send a `null` message to trigger coroutine
+    this.status = ActorStatus.CONTINUE
+    this.next()
   }
 
-  private coroutine(args: any[]) {
+  send(msg: any) {
+    if (isSystemMessage(msg)) {
+      // currently support only ExitSignal
+      // if `trapExit`, ExitSignal MAY be unpack and re-route to mailbox
+      this.onReceiveExitSignal(msg[2])
+      return msg
+    } else {
+      this.mailbox.enqueue(msg)
+      if (this._monitors.size && msg?.type === DOWN) {
+        // once DOWN message is delivered
+        // should remove record from `_monitors`
+        const downSignal = msg as DownSignal
+        const monRefId = downSignal.data.mid
+        this._monitors.delete(monRefId)
+      }
+      this.next()
+      return msg
+    }
+  }
+
+  // =================
+  // COROUTINE
+  // =================
+
+  private get top() {
+    return this.stack[this.stack.length - 1]
+  }
+  private stack: Array<Iterator<any> | AsyncIterator<any>> = []
+  private cancelReceiverTakedown: () => void = noop
+  private receiver: Receiver | undefined
+
+  private feedback: any
+  private coroutine(arg: any) {
     try {
-      return __internal__.provide(this, () => this.receive.apply(null, args))
+      return __internal__.provide(this, () => this.top.next(arg))
     } catch (err) {
       return { type: EXIT, sender: this.pid, data: err } as ExitSignal
     }
   }
 
-  next(_continue?: boolean, _sig?: any) {
-    if (!_continue) {
-      if (this.status > ActorStatus.WAITING) return
-      if (!this.mailbox.length) return
+  private handleMessage(msg: any) {
+    try {
+      return __internal__.provide(this, () => this.receiver!.call(this.module, msg))
+    } catch (err) {
+      return { type: EXIT, sender: this.pid, data: err } as ExitSignal
     }
-
-    // mark busy
-    this.status = ActorStatus.RUNNING
-    // execute coroutine
-    const ret = _continue ? _sig : this.coroutine(this.getCoroutineArgs())
-    // handle coroutine signal
-    const [nextStatus, sig] = this.handleCoroutineReturnValue(ret)
-    if (nextStatus === ActorStatus.DONE) {
-      // done
-      this.onReceiveExitSignal(sig)
-    } else {
-      this.status = nextStatus
-    }
-
-    // continue to process remaining msg in the mailbox
-    this.next()
   }
 
-  // return `true` means `this.idle = true`
-  // release lock, can process next message
-  private handleCoroutineReturnValue(sig: any): [ActorStatus, any] {
-    // 0. undefined, reuse the current receiver
-    if (sig === undefined && this.receive) {
-      return [ActorStatus.WAITING, sig]
+  next() {
+    if (this.status === ActorStatus.DONE) return
+    if (this.status === ActorStatus.RUNNING) return
+
+    let ret: any
+    if (this.status === ActorStatus.CONTINUE) {
+      const arg = this.feedback
+      this.feedback = undefined
+      ret = this.coroutine(arg)
+    } else if (this.status === ActorStatus.WAITING) {
+      if (!this.receiver || this.mailbox.length === 0) return
+
+      if (isFunction(this.receiver.canHandle)) {
+        const msg = this.mailbox.pick(this.receiver.canHandle)
+        // cannot handle any msg, keep waiting
+        if (msg === undefined) return
+        ret = this.handleMessage(msg)
+        this.cancelReceiverTakedown()
+        this.receiver = undefined // automatically take down after use
+      } else {
+        ret = this.handleMessage(this.mailbox.dequeue())
+        this.cancelReceiverTakedown()
+      }
     }
-    // 1. change behavior, ("become" in akka, "recur on self" in elixir)
-    if (typeof sig === 'function') {
-      this.receive = sig
-      return [ActorStatus.WAITING, sig]
+
+    // handle coroutine signal
+    this.arbitrate(ret)
+  }
+
+  private arbitrate(sig: any) {
+    if (this.status === ActorStatus.DONE) return
+
+    if (isIterResult(sig)) {
+      if (sig.done) this.stack.pop()
+      return this.arbitrate(sig.value)
     }
-    // 2. promise
+
+    // change behavior, ("become" in akka, "recur on self" in elixir)
+    if (isFunction(sig)) {
+      this.status = ActorStatus.WAITING
+      this.receiver = sig
+      const ttl = this.receiver!.ttl
+      if (typeof ttl === 'number' && ttl > 0) {
+        const afterFn = isFunction(this.receiver!.fallback) ? this.receiver!.fallback : noop
+        this.cancelReceiverTakedown = waitAfter(ttl, () => {
+          if (this.status === ActorStatus.DONE) return
+          // takedown receiver
+          this.cancelReceiverTakedown = noop
+          this.receiver = undefined
+          const g = { next: () => ({ done: true, value: afterFn() }) }
+          this.stack.push(g)
+          this.status = ActorStatus.CONTINUE
+          this.feedback = undefined
+          return this.next()
+        })
+      }
+      return this.next()
+    }
+
+    if (isAsyncIterator(sig) || isIterator(sig)) {
+      this.stack.push(sig)
+      this.status = ActorStatus.CONTINUE
+      this.feedback = undefined
+      return this.next()
+    }
+
+    // promise
     if (isThenable(sig)) {
+      this.status = ActorStatus.RUNNING
       sig.then(
-        sig => {
-          this.next(true, sig)
+        ret => {
+          this.arbitrate(ret)
         },
         err => {
           const sig: ExitSignal = { type: EXIT, sender: this.pid, data: err }
-          this.next(true, sig)
+          this.terminate(sig)
         }
       )
-      return [ActorStatus.RUNNING, sig]
+
+      return
     }
 
     // 3. handle coroutine error
     if (sig && sig.type === EXIT) {
-      return [ActorStatus.DONE, sig]
+      return this.terminate(sig)
     }
 
-    const exitSig: ExitSignal = { type: EXIT, sender: this.pid, data: NORMAL }
-    return [ActorStatus.DONE, exitSig]
+    if (this.stack.length) {
+      this.status = ActorStatus.CONTINUE
+      this.feedback = sig
+      return this.next()
+    } else if (this.receiver) {
+      this.status = ActorStatus.WAITING
+      return this.next()
+    } else {
+      const exitSig: ExitSignal = { type: EXIT, sender: this.pid, data: NORMAL }
+      return this.terminate(exitSig)
+    }
   }
-}
-
-class Mailbox<M = any> {
-  private _buffer: Array<M> = []
-  private _queue: Array<M> = []
-
-  stash(item: M) {
-    this._buffer.push(item)
-  }
-
-  unstashAll(filter?: (item: M) => boolean) {
-    if (!this._buffer.length) return
-    const buffer = typeof filter === 'function' ? this._buffer.filter(filter) : this._buffer.slice()
-    this._buffer = []
-    this._queue = buffer.concat(this._queue)
-  }
-
-  enqueue(item: M) {
-    this._queue.push(item)
-  }
-
-  dequeue() {
-    return this._queue.shift()
-  }
-
-  get length() {
-    return this._queue.length
-  }
-}
-
-function isThenable(t: any): t is Promise<any> {
-  return typeof t?.then === 'function'
 }
