@@ -30,7 +30,7 @@ export function exit(reason: any): never {
   throw `Exit with reason: ${reason}`
 }
 
-export module Process {
+export namespace Process {
   export function list() {
     return __internal__.listProcs()
   }

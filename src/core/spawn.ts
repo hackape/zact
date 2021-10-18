@@ -1,7 +1,7 @@
 import type { ActorRef } from './types'
 import { Actor } from './actor'
 
-type AnyFunction = (...args: any) => any
+type AnyFunction = (...args: any[]) => any
 export function spawn<F extends AnyFunction>(fn: F, options?: SpawnOpts): ActorRef
 export function spawn<F extends AnyFunction>(fn: F, args: Parameters<F>, options?: SpawnOpts): ActorRef
 export function spawn(m: any, f: string, a: any[], options?: SpawnOpts): ActorRef
